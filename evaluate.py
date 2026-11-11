@@ -1,4 +1,6 @@
-from rag import build_index, search, ask
+import numpy as np
+
+from rag import Chunker, Found, build_index, search, ask, split_into_chunks, chunk_by_sentences, chunk_by_sections
 
 REFUSAL = "В документе этого нет"
 
@@ -36,16 +38,17 @@ NO_ANSWER = [
 ]
 
 
-def find_rank(found, expected):
+def find_rank(found: Found, expected: str) -> int | None:
     for i, (score, text) in enumerate(found, start=1):
         if expected.lower() in text.lower():
             return i
     return None
 
 
-def evaluate(eval_set, chunks, chunk_vectors, k, show_misses=False):
+def evaluate(eval_set: list[dict[str, str]], chunks: list[str], chunk_vectors: np.ndarray, k: int,
+             show_misses: bool = False) -> tuple[float, float]:
     hits = 0
-    rr_sum = 0
+    rr_sum = 0.0
     for item in eval_set:
         found = search(item["question"], chunks, chunk_vectors, k)
         rank = find_rank(found, item["expected"])
@@ -58,7 +61,7 @@ def evaluate(eval_set, chunks, chunk_vectors, k, show_misses=False):
     return hits / len(eval_set), rr_sum / len(eval_set)
 
 
-def check_refusals(questions, chunks, chunk_vectors):
+def check_refusals(questions: list[str], chunks: list[str], chunk_vectors: np.ndarray) -> float:
     refusals = 0
     for question in questions:
         answer, found = ask(question, chunks, chunk_vectors)
@@ -69,6 +72,27 @@ def check_refusals(questions, chunks, chunk_vectors):
     return refusals / len(questions)
 
 
+STRATEGIES: dict[str, Chunker] = {
+    "абзацы": split_into_chunks,
+    "предложения": chunk_by_sentences,
+    "окно 2": lambda text: chunk_by_sentences(text, n=2),
+    "окно 2 перекрытие": lambda text: chunk_by_sentences(text, n=2, step=1),
+    "окно 3": lambda text: chunk_by_sentences(text, n=3),
+    "разделы": chunk_by_sections,
+}
+
+
+def compare_strategies(strategies: dict[str, Chunker]) -> None:
+    for name, chunker in strategies.items():
+        chunks, chunk_vectors = build_index(chunker=chunker)
+        avg_len = sum(len(chunk) for chunk in chunks) / len(chunks)
+
+        hit1, _ = evaluate(EVAL_SET, chunks, chunk_vectors, k=1, show_misses=True)
+        hit3, mrr = evaluate(EVAL_SET, chunks, chunk_vectors, k=3, show_misses=True)
+        print(f"{name:<18}  кусков: {len(chunks):>3}   ср. длина: {avg_len:>4.0f}   "
+              f"hit@1 = {hit1:.2f}   hit@3 = {hit3:.2f}   MRR = {mrr:.2f}")
+
+
 if __name__ == "__main__":
     chunks, chunk_vectors = build_index()
 
@@ -76,6 +100,9 @@ if __name__ == "__main__":
     for k in (1, 3, 5):
         hit_rate, mrr = evaluate(EVAL_SET, chunks, chunk_vectors, k, show_misses=(k == 3))
         print(f"k={k}:  hit@k = {hit_rate:.2f}   MRR = {mrr:.2f}")
+
+    print("\n=== Сравнение нарезок ===")
+    compare_strategies(STRATEGIES)
 
     print("\n=== Вопросы без ответа ===")
     refusal_rate = check_refusals(NO_ANSWER, chunks, chunk_vectors)
