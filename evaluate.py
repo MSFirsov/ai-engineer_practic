@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 
 from rag import Chunker, Found, build_index, search, ask, split_into_chunks, chunk_by_sentences, chunk_by_sections
@@ -84,16 +86,19 @@ STRATEGIES: dict[str, Chunker] = {
 
 def compare_strategies(strategies: dict[str, Chunker]) -> None:
     for name, chunker in strategies.items():
+        start = time.perf_counter()
         chunks, chunk_vectors = build_index(chunker=chunker)
+        index_time = time.perf_counter() - start
         avg_len = sum(len(chunk) for chunk in chunks) / len(chunks)
 
         hit1, _ = evaluate(EVAL_SET, chunks, chunk_vectors, k=1, show_misses=True)
         hit3, mrr = evaluate(EVAL_SET, chunks, chunk_vectors, k=3, show_misses=True)
         print(f"{name:<18}  кусков: {len(chunks):>3}   ср. длина: {avg_len:>4.0f}   "
-              f"hit@1 = {hit1:.2f}   hit@3 = {hit3:.2f}   MRR = {mrr:.2f}")
+              f"hit@1 = {hit1:.2f}   hit@3 = {hit3:.2f}   MRR = {mrr:.2f}   индекс: {index_time:.2f} с")
 
 
 if __name__ == "__main__":
+    total_start = time.perf_counter()
     chunks, chunk_vectors = build_index()
 
     print("=== Поиск ===")
@@ -102,8 +107,12 @@ if __name__ == "__main__":
         print(f"k={k}:  hit@k = {hit_rate:.2f}   MRR = {mrr:.2f}")
 
     print("\n=== Сравнение нарезок ===")
+    start = time.perf_counter()
     compare_strategies(STRATEGIES)
+    print(f"Сравнение нарезок: {time.perf_counter() - start:.1f} с")
 
     print("\n=== Вопросы без ответа ===")
+    start = time.perf_counter()
     refusal_rate = check_refusals(NO_ANSWER, chunks, chunk_vectors)
-    print(f"\nОтказов: {refusal_rate:.2f}")
+    print(f"\nОтказов: {refusal_rate:.2f}   время: {time.perf_counter() - start:.1f} с")
+    print(f"Всего: {time.perf_counter() - total_start:.1f} с")

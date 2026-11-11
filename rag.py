@@ -1,7 +1,8 @@
+import hashlib
 import os
 import re
 from collections.abc import Callable
-from functools import partial
+from functools import partial, lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ client = OpenAI()
 CHAT_MODEL = os.environ["CHAT_MODEL"]
 EMBED_MODEL = os.environ["EMBED_MODEL"]
 HANDBOOK = Path(__file__).resolve().parent / "handbook.txt"
+CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "embeddings"
 
 Chunker = Callable[[str], list[str]]
 Found = list[tuple[float, str]]
@@ -22,6 +24,22 @@ Found = list[tuple[float, str]]
 def embed(texts: list[str]) -> np.ndarray:
     resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
     return np.array([d.embedding for d in resp.data])
+
+
+def cache_key(text: str) -> str:
+    data = f"{EMBED_MODEL}\n{text}"
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+def embed_cached(texts: list[str]) -> np.ndarray:
+    paths = [CACHE_DIR / f"{cache_key(t)}.npy" for t in texts]
+    missing = [i for i, p in enumerate(paths) if not p.exists()]
+    if missing:
+        vectors = embed([texts[i] for i in missing])
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        for i, vector in zip(missing, vectors):
+            np.save(paths[i], vector)
+    print(f"эмбеддинги: из кэша {len(texts) - len(missing)}, посчитано {len(missing)}")
+    return np.array([np.load(p) for p in paths])
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -74,11 +92,16 @@ def chunk_by_sections(text: str) -> list[str]:
 
 def build_index(path: Path = HANDBOOK, chunker: Chunker = partial(chunk_by_sentences, n=2)) -> tuple[list[str], np.ndarray]:
     chunks = chunker(path.read_text(encoding="utf-8"))
-    return chunks, embed(chunks)
+    return chunks, embed_cached(chunks)
+
+
+@lru_cache(maxsize=1000)
+def embed_query(query: str) -> np.ndarray:
+    return embed([query])[0]
 
 
 def search(query: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3) -> Found:
-    query_vec = embed([query])[0]
+    query_vec = embed_query(query)
     scores = [cosine(query_vec, v) for v in chunk_vectors]
     ranked = sorted(zip(scores, chunks), reverse=True)
     return ranked[:k]
