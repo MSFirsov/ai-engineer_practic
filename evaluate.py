@@ -2,7 +2,7 @@ import time
 
 import numpy as np
 
-from rag import Chunker, Found, build_index, search, ask, split_into_chunks, chunk_by_sentences, chunk_by_sections
+from rag import Chunker, Found, build_index, search, ask, rewrite_query, split_into_chunks, chunk_by_sentences, chunk_by_sections
 
 REFUSAL = "В документе этого нет"
 
@@ -39,8 +39,51 @@ NO_ANSWER = [
     "Компенсируют ли проезд от дома до офиса?",
 ]
 
+FOLLOWUP_SET = [
+    {"history": [("Сколько компания компенсирует на обучение?", "До 60 000 рублей в год.")],
+     "question": "А на спорт?", "expected": "3 000 рублей"},
+    {"history": [("Какой ноутбук можно выбрать?", "MacBook Pro или Lenovo ThinkPad.")],
+     "question": "А как часто их меняют?", "expected": "раз в 3 года"},
+    {"history": [("Можно ли работать из дома?", "Да, до 3 дней в неделю без согласований.")],
+     "question": "А полностью?", "expected": "Полностью удалённый"},
+    {"history": [("Когда летний выезд?", "Каждый июль, на Онежское озеро на два дня.")],
+     "question": "А новогодний?", "expected": "последнюю пятницу декабря"},
+    {"history": [("Сколько длится испытательный срок?", "3 месяца.")],
+     "question": "Что дают после него?", "expected": "ДМС"},
+    {"history": [("Сколько дней здоровья в году?", "5 дней.")],
+     "question": "Они переносятся на следующий год?", "expected": "Дни здоровья не переносятся"},
+    {"history": [("Кто генеральный директор?", "Ирина Валенкова.")],
+     "question": "А технический?", "expected": "Павел Огнев"},
+    {"history": [("Как подать заявление на отпуск?", "Через бота @tundra_hr_bot не позднее чем за 14 дней.")],
+     "question": "А кто его согласует?", "expected": "согласует непосредственный"},
+    {"history": [("Как вернуть деньги за такси?", "Заполнить таблицу расходов до 5 числа и приложить чеки.")],
+     "question": "А когда их вернут?", "expected": "ближайшей зарплатой"},
+    {"history": [("Сколько дней отпуска в году?", "28 календарных дней.")],
+     "question": "А в офисе есть кот?", "expected": "Байт"},
+    {"history": [("Где находится офис?", "В бизнес-центре «Онего», на 4 этаже.")],
+     "question": "А кто там живёт?", "expected": "Байт"},
+    {"history": [("Куда писать, если сломался ноутбук?", "В канал #it-help.")],
+     "question": "А что с ним делать при увольнении?", "expected": "вернуть в течение 5"},
+    {"history": [("Сколько дней здоровья в году?", "5 дней."),
+                 ("А если болезнь длится дольше?", "Нужно оформить больничный лист и отправить его номер Дарье Лосевой.")],
+     "question": "А их можно перенести на следующий год?", "expected": "Дни здоровья не переносятся"},
+    {"history": [("Сколько компания компенсирует на обучение?", "До 60 000 рублей в год.")],
+     "question": "Во сколько стендап?", "expected": "11:15"},
+]
+
 
 def find_rank(found: Found, expected: str) -> int | None:
+    """Ищет, на каком месте в выдаче стоит кусок с ожидаемой подстрокой.
+
+    Сравнение идёт без учёта регистра.
+
+    Args:
+        found: Результат search: пары (близость, кусок).
+        expected: Подстрока, которая должна быть в правильном куске.
+
+    Returns:
+        Место первого подходящего куска, считая с 1, или None, если его нет в выдаче.
+    """
     for i, (score, text) in enumerate(found, start=1):
         if expected.lower() in text.lower():
             return i
@@ -49,6 +92,20 @@ def find_rank(found: Found, expected: str) -> int | None:
 
 def evaluate(eval_set: list[dict[str, str]], chunks: list[str], chunk_vectors: np.ndarray, k: int,
              show_misses: bool = False) -> tuple[float, float]:
+    """Считает качество поиска на наборе вопросов.
+
+    Args:
+        eval_set: Словари с ключами "question" (по нему идёт поиск) и "expected"
+            (подстрока правильного куска).
+        chunks: Куски документа.
+        chunk_vectors: Матрица эмбеддингов кусков.
+        k: Сколько кусков брать из выдачи.
+        show_misses: Печатать ли вопросы, для которых нужный кусок не попал в top-k.
+
+    Returns:
+        Пара (hit@k, MRR): доля вопросов с нужным куском в top-k
+        и среднее значение 1/место, где промах считается за 0.
+    """
     hits = 0
     rr_sum = 0.0
     for item in eval_set:
@@ -64,6 +121,19 @@ def evaluate(eval_set: list[dict[str, str]], chunks: list[str], chunk_vectors: n
 
 
 def check_refusals(questions: list[str], chunks: list[str], chunk_vectors: np.ndarray) -> float:
+    """Проверяет, отказывается ли модель отвечать на вопросы, которых нет в документе.
+
+    Для каждого вопроса вызывает ask и печатает вопрос и ответ. Отказом считается
+    ответ, в котором есть фраза REFUSAL.
+
+    Args:
+        questions: Вопросы без ответа в документе.
+        chunks: Куски документа.
+        chunk_vectors: Матрица эмбеддингов кусков.
+
+    Returns:
+        Доля вопросов, на которые модель ответила отказом.
+    """
     refusals = 0
     for question in questions:
         answer, found = ask(question, chunks, chunk_vectors)
@@ -85,6 +155,15 @@ STRATEGIES: dict[str, Chunker] = {
 
 
 def compare_strategies(strategies: dict[str, Chunker]) -> None:
+    """Сравнивает стратегии нарезки на EVAL_SET.
+
+    Для каждой стратегии строит индекс и печатает строку: число кусков, средняя
+    длина куска, hit@1, hit@3, MRR и время построения индекса. Перед строкой
+    печатаются промахи.
+
+    Args:
+        strategies: Словарь «название стратегии → функция нарезки».
+    """
     for name, chunker in strategies.items():
         start = time.perf_counter()
         chunks, chunk_vectors = build_index(chunker=chunker)
@@ -95,6 +174,48 @@ def compare_strategies(strategies: dict[str, Chunker]) -> None:
         hit3, mrr = evaluate(EVAL_SET, chunks, chunk_vectors, k=3, show_misses=True)
         print(f"{name:<18}  кусков: {len(chunks):>3}   ср. длина: {avg_len:>4.0f}   "
               f"hit@1 = {hit1:.2f}   hit@3 = {hit3:.2f}   MRR = {mrr:.2f}   индекс: {index_time:.2f} с")
+
+
+def make_query(item: dict, mode: str) -> str:
+    """Строит строку для поиска по уточняющему вопросу одним из трёх подходов.
+
+    Args:
+        item: Элемент FOLLOWUP_SET с ключами "history", "question" и "expected".
+        mode: Подход: "как есть" — сам вопрос, "склейка" — предыдущий вопрос
+            пользователя плюс текущий, "переписывание" — результат rewrite_query.
+
+    Returns:
+        Строка, по которой будет идти поиск.
+    """
+    if mode == "склейка":
+        return f"{item['history'][-1][0]} {item['question']}"
+    if mode == "переписывание":
+        return rewrite_query(item["question"], item["history"])
+    return item["question"]
+
+
+def compare_followups(followup_set: list[dict], chunks: list[str], chunk_vectors: np.ndarray) -> None:
+    """Сравнивает три подхода к уточняющим вопросам.
+
+    Для каждого подхода один раз строит набор запросов через make_query и печатает
+    строку: hit@1, hit@3, MRR и время построения запросов.
+
+    Args:
+        followup_set: Уточняющие вопросы с историей и ожидаемой подстрокой.
+        chunks: Куски документа.
+        chunk_vectors: Матрица эмбеддингов кусков.
+    """
+    modes = ["как есть", "склейка", "переписывание"]
+    for mode in modes:
+        start = time.perf_counter()
+        eval_set = []
+        for item in followup_set:
+            eval_set.append({"question": make_query(item, mode), "expected": item["expected"]})
+        query_time = time.perf_counter() - start
+
+        hit1, _ = evaluate(eval_set, chunks, chunk_vectors, k=1)
+        hit3, mrr = evaluate(eval_set, chunks, chunk_vectors, k=3, show_misses=True)
+        print(f"{mode:<15} hit@1 = {hit1:.2f}   hit@3 = {hit3:.2f}   MRR = {mrr:.2f}   запросы: {query_time:.1f} с")
 
 
 if __name__ == "__main__":
@@ -110,6 +231,11 @@ if __name__ == "__main__":
     start = time.perf_counter()
     compare_strategies(STRATEGIES)
     print(f"Сравнение нарезок: {time.perf_counter() - start:.1f} с")
+
+    print("\n=== Уточняющие вопросы ===")
+    start = time.perf_counter()
+    compare_followups(FOLLOWUP_SET, chunks, chunk_vectors)
+    print(f"Уточняющие вопросы: {time.perf_counter() - start:.1f} с")
 
     print("\n=== Вопросы без ответа ===")
     start = time.perf_counter()
