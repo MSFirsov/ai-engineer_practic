@@ -1,10 +1,9 @@
+import sys
 import time
 
 import numpy as np
 
-from rag import Chunker, Found, build_index, search, ask, rewrite_query, split_into_chunks, chunk_by_sentences, chunk_by_sections
-
-REFUSAL = "В документе этого нет"
+from rag import REFUSAL, Chunker, Found, build_index, search, ask, rewrite_query, split_into_chunks, chunk_by_sentences, chunk_by_sections
 
 EVAL_SET = [
     {"question": "Сколько дней отпуска в году?", "expected": "28 календарных"},
@@ -219,6 +218,7 @@ def compare_followups(followup_set: list[dict], chunks: list[str], chunk_vectors
 
 
 if __name__ == "__main__":
+    fast = "--fast" in sys.argv
     total_start = time.perf_counter()
     chunks, chunk_vectors = build_index()
 
@@ -232,13 +232,14 @@ if __name__ == "__main__":
     compare_strategies(STRATEGIES)
     print(f"Сравнение нарезок: {time.perf_counter() - start:.1f} с")
 
-    print("\n=== Уточняющие вопросы ===")
-    start = time.perf_counter()
-    compare_followups(FOLLOWUP_SET, chunks, chunk_vectors)
-    print(f"Уточняющие вопросы: {time.perf_counter() - start:.1f} с")
+    if not fast:
+        print("\n=== Уточняющие вопросы ===")
+        start = time.perf_counter()
+        compare_followups(FOLLOWUP_SET, chunks, chunk_vectors)
+        print(f"Уточняющие вопросы: {time.perf_counter() - start:.1f} с")
 
-    print("\n=== Вопросы без ответа ===")
-    start = time.perf_counter()
-    refusal_rate = check_refusals(NO_ANSWER, chunks, chunk_vectors)
-    print(f"\nОтказов: {refusal_rate:.2f}   время: {time.perf_counter() - start:.1f} с")
+        print("\n=== Вопросы без ответа ===")
+        start = time.perf_counter()
+        refusal_rate = check_refusals(NO_ANSWER, chunks, chunk_vectors)
+        print(f"\nОтказов: {refusal_rate:.2f}   время: {time.perf_counter() - start:.1f} с")
     print(f"Всего: {time.perf_counter() - total_start:.1f} с")

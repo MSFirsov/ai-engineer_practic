@@ -1,6 +1,7 @@
 import hashlib
 import os
 import re
+import readline
 from collections.abc import Callable
 from functools import partial, lru_cache
 from pathlib import Path
@@ -23,6 +24,7 @@ Found = list[tuple[float, str]]
 History = list[tuple[str, str]]
 
 MAX_HISTORY = 3
+REFUSAL = "В документе этого нет"
 REWRITE_RULE = (
     "Ты переписываешь вопросы для поиска по документу. Перепиши последний вопрос пользователя так, "
     "чтобы он был понятен без истории диалога. Если вопрос и так понятен, верни его без изменений. "
@@ -246,9 +248,38 @@ def build_prompt(question: str, found: Found) -> str:
         Текст промпта. Правило требует отвечать только по контексту
         и отказывать фразой «В документе этого нет», если ответа нет.
     """
-    rule = "Ответь на вопрос, используя только информацию из контекста. Если в контексте нет ответа, скажи: «В документе этого нет»."
+    rule = f"Ответь на вопрос, используя только информацию из контекста. Если в контексте нет ответа, скажи: «{REFUSAL}»."
     context = "\n\n".join(chunk for score, chunk in found)
     return f"{rule}\n\nКонтекст:\n{context}\n\nВопрос: {question}"
+
+
+def chunk_section(chunk: str) -> str:
+    """Достаёт название раздела из куска.
+
+    Args:
+        chunk: Кусок вида "[РАЗДЕЛ]\\nтекст".
+
+    Returns:
+        Название раздела без квадратных скобок.
+    """
+    return chunk.split("\n", 1)[0].strip("[]")
+
+
+def list_sources(found: Found) -> list[str]:
+    """Собирает разделы найденных кусков без повторов.
+
+    Args:
+        found: Результат search: пары (близость, кусок).
+
+    Returns:
+        Названия разделов в порядке выдачи: первым идёт раздел самого похожего куска.
+    """
+    sections: list[str] = []
+    for score, chunk in found:
+        section = chunk_section(chunk)
+        if section not in sections:
+            sections.append(section)
+    return sections
 
 
 def rewrite_query(question: str, history: History) -> str:
@@ -331,3 +362,5 @@ if __name__ == "__main__":
             print(f"{score:.3f}  {chunk[:80]!r}")
         print("\n--- Ответ ---")
         print(answer)
+        if REFUSAL not in answer:
+            print("Источник: ", "; ".join(list_sources(found)))
