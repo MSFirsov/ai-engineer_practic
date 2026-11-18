@@ -3,7 +3,8 @@ import time
 
 import numpy as np
 
-from rag import REFUSAL, Chunker, Found, build_index, search, ask, rewrite_query, split_into_chunks, chunk_by_sentences, chunk_by_sections
+from rag import (REFUSAL, Chunker, Found, Searcher, build_index, search, keyword_search, hybrid_search, ask,
+                 rewrite_query, split_into_chunks, chunk_by_sentences, chunk_by_sections)
 
 EVAL_SET = [
     {"question": "Сколько дней отпуска в году?", "expected": "28 календарных"},
@@ -36,6 +37,23 @@ NO_ANSWER = [
     "Сколько дней отпуска можно взять на испытательном сроке?",
     "Кто уборщик в офисе?",
     "Компенсируют ли проезд от дома до офиса?",
+]
+
+EXACT_SET = [
+    {"question": "@tundra_hr_bot", "expected": "@tundra_hr_bot"},
+    {"question": "Что за бот tundra_hr_bot?", "expected": "@tundra_hr_bot"},
+    {"question": "#it-help", "expected": "напишите в канал #it-help"},
+    {"question": "Для чего канал #security?", "expected": "сообщайте в канал #security"},
+    {"question": "Кто такой Сорокин?", "expected": "системный администратор"},
+    {"question": "Кто такой Огнев?", "expected": "Техническим директором"},
+    {"question": "Кто такая Лосева?", "expected": "HR-менеджеру Дарье"},
+    {"question": "ThinkPad", "expected": "ThinkPad"},
+    {"question": "Что такое ДМС?", "expected": "ДМС"},
+    {"question": "Что такое Онего?", "expected": "Онего"},
+    {"question": "Что в 15:00?", "expected": "15:00"},
+    {"question": "Что происходит в 11:15?", "expected": "11:15"},
+    {"question": "хакатон", "expected": "хакатон"},
+    {"question": "Что такое бадди?", "expected": "бадди"},
 ]
 
 FOLLOWUP_SET = [
@@ -90,7 +108,7 @@ def find_rank(found: Found, expected: str) -> int | None:
 
 
 def evaluate(eval_set: list[dict[str, str]], chunks: list[str], chunk_vectors: np.ndarray, k: int,
-             show_misses: bool = False) -> tuple[float, float]:
+             show_misses: bool = False, searcher: Searcher = search) -> tuple[float, float]:
     """Считает качество поиска на наборе вопросов.
 
     Args:
@@ -100,6 +118,7 @@ def evaluate(eval_set: list[dict[str, str]], chunks: list[str], chunk_vectors: n
         chunk_vectors: Матрица эмбеддингов кусков.
         k: Сколько кусков брать из выдачи.
         show_misses: Печатать ли вопросы, для которых нужный кусок не попал в top-k.
+        searcher: Функция поиска. По умолчанию поиск по смыслу (search).
 
     Returns:
         Пара (hit@k, MRR): доля вопросов с нужным куском в top-k
@@ -108,7 +127,7 @@ def evaluate(eval_set: list[dict[str, str]], chunks: list[str], chunk_vectors: n
     hits = 0
     rr_sum = 0.0
     for item in eval_set:
-        found = search(item["question"], chunks, chunk_vectors, k)
+        found = searcher(item["question"], chunks, chunk_vectors, k)
         rank = find_rank(found, item["expected"])
         if rank is None:
             if show_misses:
@@ -175,6 +194,33 @@ def compare_strategies(strategies: dict[str, Chunker]) -> None:
               f"hit@1 = {hit1:.2f}   hit@3 = {hit3:.2f}   MRR = {mrr:.2f}   индекс: {index_time:.2f} с")
 
 
+SEARCHERS: dict[str, Searcher] = {
+    "по смыслу": search,
+    "по словам": lambda query, chunks, chunk_vectors, k: keyword_search(query, chunks, k),
+    "гибрид": hybrid_search,
+}
+
+
+def compare_searchers(searchers: dict[str, Searcher], sets: dict[str, list[dict[str, str]]],
+                      chunks: list[str], chunk_vectors: np.ndarray) -> None:
+    """Сравнивает способы поиска на нескольких наборах вопросов.
+
+    Для каждого набора и каждого способа печатает строку: hit@1, hit@3 и MRR.
+
+    Args:
+        searchers: Словарь «название способа → функция поиска».
+        sets: Словарь «название набора → вопросы с ожидаемой подстрокой».
+        chunks: Куски документа.
+        chunk_vectors: Матрица эмбеддингов кусков.
+    """
+    for set_name, eval_set in sets.items():
+        print(f"{set_name} ({len(eval_set)} вопросов)")
+        for name, searcher in searchers.items():
+            hit1, _ = evaluate(eval_set, chunks, chunk_vectors, k=1, searcher=searcher)
+            hit3, mrr = evaluate(eval_set, chunks, chunk_vectors, k=3, searcher=searcher)
+            print(f"  {name:<10} hit@1 = {hit1:.2f}   hit@3 = {hit3:.2f}   MRR = {mrr:.2f}")
+
+
 def make_query(item: dict, mode: str) -> str:
     """Строит строку для поиска по уточняющему вопросу одним из трёх подходов.
 
@@ -231,6 +277,9 @@ if __name__ == "__main__":
     start = time.perf_counter()
     compare_strategies(STRATEGIES)
     print(f"Сравнение нарезок: {time.perf_counter() - start:.1f} с")
+
+    print("\n=== Сравнение поисков ===")
+    compare_searchers(SEARCHERS, {"обычные вопросы": EVAL_SET, "точные запросы": EXACT_SET}, chunks, chunk_vectors)
 
     if not fast:
         print("\n=== Уточняющие вопросы ===")

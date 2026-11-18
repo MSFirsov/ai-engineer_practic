@@ -1,7 +1,9 @@
 import hashlib
+import math
 import os
 import re
 import readline
+import sys
 from collections.abc import Callable
 from functools import partial, lru_cache
 from pathlib import Path
@@ -22,8 +24,16 @@ CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "embeddings"
 Chunker = Callable[[str], list[str]]
 Found = list[tuple[float, str]]
 History = list[tuple[str, str]]
+Searcher = Callable[[str, list[str], np.ndarray, int], Found]
 
 MAX_HISTORY = 3
+POOL = 10
+RRF_K = 60
+STOP_WORDS = set(
+    "а в во и или ли не на с со к ко по о об от до за из у что кто как когда где куда сколько "
+    "какой какая какое какие если я мы вы он она они это то же бы для при есть нет можно нужно "
+    "такое такой такая чем".split()
+)
 REFUSAL = "В документе этого нет"
 REWRITE_RULE = (
     "Ты переписываешь вопросы для поиска по документу. Перепиши последний вопрос пользователя так, "
@@ -237,6 +247,93 @@ def search(query: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3)
     return ranked[:k]
 
 
+def tokenize(text: str) -> list[str]:
+    """Разбивает текст на слова для поиска по словам.
+
+    Слова приводятся к нижнему регистру, «ё» заменяется на «е». Знаки @ и # отбрасываются,
+    дефис и двоеточие внутри слова сохраняются: "#it-help" даёт "it-help", "11:15" остаётся целым.
+
+    Args:
+        text: Текст куска или запроса.
+
+    Returns:
+        Список слов без стоп-слов из STOP_WORDS.
+    """
+    words = re.findall(r"\w+(?:[:-]\w+)*", text.lower().replace("ё", "е"))
+    words = [word for word in words if word not in STOP_WORDS]
+    return words
+
+
+def bm25_scores(query: str, chunks: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
+    """Считает для каждого куска оценку BM25: насколько он подходит запросу по совпадению слов.
+
+    Оценка куска — сумма по словам запроса. Слово даёт тем больше, чем реже оно
+    встречается в документе и чем чаще в этом куске. Длинные куски получают штраф.
+
+    Args:
+        query: Текст запроса.
+        chunks: Куски документа.
+        k1: Насколько быстро перестают помогать повторы слова в куске.
+        b: Сила штрафа за длину куска, от 0 (нет штрафа) до 1.
+
+    Returns:
+        Оценки в порядке chunks. Ноль означает, что общих слов с запросом нет.
+    """
+    chunk_words = [tokenize(chunk) for chunk in chunks]
+    avg_len = sum(len(words) for words in chunk_words) / len(chunks)
+    scores = [0.0] * len(chunks)
+    for word in set(tokenize(query)):
+        chunks_with_word = sum(1 for words in chunk_words if word in words)
+        if chunks_with_word == 0:
+            continue
+        rarity = math.log((len(chunks) - chunks_with_word + 0.5) / (chunks_with_word + 0.5) + 1)
+        for i, words in enumerate(chunk_words):
+            count = words.count(word)
+            scores[i] += rarity * count * (k1 + 1) / (count + k1 * (1 - b + b * len(words) / avg_len))
+    return scores
+
+
+def keyword_search(query: str, chunks: list[str], k: int = 3) -> Found:
+    """Находит k кусков, лучших по совпадению слов с запросом (BM25).
+
+    Args:
+        query: Текст запроса.
+        chunks: Куски документа.
+        k: Сколько кусков вернуть.
+
+    Returns:
+        Список пар (оценка BM25, кусок) от лучшего к худшему. Куски без общих слов
+        с запросом не возвращаются, поэтому список может быть короче k или пустым.
+    """
+    ranked = sorted(zip(bm25_scores(query, chunks), chunks), reverse=True)
+    return [(score, chunk) for score, chunk in ranked[:k] if score > 0]
+
+
+def hybrid_search(query: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3) -> Found:
+    """Объединяет поиск по смыслу и поиск по словам через Reciprocal Rank Fusion.
+
+    Каждый поиск возвращает POOL лучших кусков. Кусок получает 1 / (RRF_K + место)
+    за каждый список, в котором он есть, и эти числа складываются.
+
+    Args:
+        query: Текст запроса.
+        chunks: Куски документа.
+        chunk_vectors: Матрица эмбеддингов кусков.
+        k: Сколько кусков вернуть.
+
+    Returns:
+        Список пар (суммарная оценка, кусок) от лучшего к худшему.
+    """
+    by_meaning = search(query, chunks, chunk_vectors, POOL)
+    by_words = keyword_search(query, chunks, POOL)
+    scores: dict[str, float] = {}
+    for found in (by_meaning, by_words):
+        for rank, (score, chunk) in enumerate(found, start=1):
+            scores[chunk] = scores.get(chunk, 0.0) + 1 / (RRF_K + rank)
+    ranked = sorted(((score, chunk) for chunk, score in scores.items()), reverse=True)
+    return ranked[:k]
+
+
 def build_prompt(question: str, found: Found) -> str:
     """Собирает промпт для генератора: правило, найденный контекст и вопрос.
 
@@ -311,7 +408,7 @@ def rewrite_query(question: str, history: History) -> str:
 
 
 def ask(question: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3,
-        history: History | None = None) -> tuple[str, Found]:
+        history: History | None = None, searcher: Searcher = search) -> tuple[str, Found]:
     """Отвечает на вопрос по документу с учётом истории диалога.
 
     Переписывает вопрос, ищет по переписанному варианту и отдаёт модели историю
@@ -324,6 +421,7 @@ def ask(question: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3,
         chunk_vectors: Матрица эмбеддингов кусков.
         k: Сколько кусков положить в контекст.
         history: Предыдущие пары (вопрос, ответ). None означает пустую историю.
+        searcher: Функция поиска. По умолчанию поиск по смыслу (search).
 
     Returns:
         Пара (ответ модели, найденные куски с их близостью).
@@ -332,7 +430,7 @@ def ask(question: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3,
     query = rewrite_query(question, history)
     if query != question:
         print(f"Запрос для поиска: {query}")
-    found = search(query, chunks, chunk_vectors, k)
+    found = searcher(query, chunks, chunk_vectors, k)
     messages: list[ChatCompletionMessageParam] = []
     for q, a in history:
         messages.append({"role": "user", "content": q})
@@ -350,12 +448,17 @@ if __name__ == "__main__":
     chunks, chunk_vectors = build_index()
     print(f"Кусков: {len(chunks)}, векторы: {chunk_vectors.shape}")
 
+    searcher: Searcher = search
+    if "--hybrid" in sys.argv:
+        searcher = hybrid_search
+    print(f"Поиск: {searcher.__name__}")
+
     history: History = []
     while True:
         question = input("\nВопрос: ")
         if question.lower() in ("выход", "exit"):
             break
-        answer, found = ask(question, chunks, chunk_vectors, history=history[-MAX_HISTORY:])
+        answer, found = ask(question, chunks, chunk_vectors, history=history[-MAX_HISTORY:], searcher=searcher)
         history.append((question, answer))
         print("\n--- Найденные куски ---")
         for score, chunk in found:
