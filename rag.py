@@ -10,10 +10,13 @@ from pathlib import Path
 
 import chromadb
 import numpy as np
-from sentence_transformers import CrossEncoder
+from chromadb.api.types import Metadata
+from docx import Document
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
+from pypdf import PdfReader
+from sentence_transformers import CrossEncoder
 
 load_dotenv()
 
@@ -111,14 +114,17 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
-def split_into_paragraphs(text: str) -> list[tuple[str, str]]:
+def split_into_paragraphs(
+        text: str, *, detect_sections: bool = True
+) -> list[tuple[str, str]]:
     """Делит документ на абзацы и запоминает раздел каждого.
 
-    Абзацы разделены пустой строкой. Блок, написанный целиком заглавными буквами,
+    Абзацы разделены пустой строкой. По умолчанию блок из заглавных букв
     считается заголовком раздела и в результат не попадает.
 
     Args:
         text: Полный текст документа.
+        detect_sections: Считать ли блоки заглавными буквами заголовками.
 
     Returns:
         Список пар (название раздела, текст абзаца) в порядке документа.
@@ -129,7 +135,7 @@ def split_into_paragraphs(text: str) -> list[tuple[str, str]]:
         block = block.strip()
         if not block:
             continue
-        if block.isupper():
+        if detect_sections and block.isupper():
             section = block
             continue
         paragraphs.append((section, block))
@@ -160,7 +166,31 @@ def split_into_sentences(paragraph: str) -> list[str]:
     return re.split(r"(?<=[.!?])\s+", paragraph)
 
 
-def chunk_by_sentences(text: str, n: int = 1, step: int | None = None) -> list[str]:
+def chunk_paragraphs(
+        paragraphs: list[tuple[str, str]], n: int = 1, step: int | None = None
+) -> list[str]:
+    """Режет готовые абзацы на окна предложений.
+
+    Args:
+        paragraphs: Пары (название раздела, текст абзаца) по порядку.
+        n: Сколько предложений входит в окно.
+        step: Сдвиг окна. Если None, окно сдвигается на n предложений.
+
+    Returns:
+        Куски с заголовком раздела в первой строке.
+    """
+    chunks = []
+    for section, paragraph in paragraphs:
+        sentences = split_into_sentences(paragraph)
+        for i in range(0, len(sentences), step if step is not None else n):
+            group = " ".join(sentences[i:i + n])
+            chunks.append(f"[{section}]\n{group}")
+    return chunks
+
+
+def chunk_by_sentences(
+        text: str, n: int = 1, step: int | None = None, *, detect_sections: bool = True
+) -> list[str]:
     """Режет документ на куски по n предложений внутри каждого абзаца.
 
     Окно не выходит за границу абзаца, поэтому последний кусок абзаца может быть короче.
@@ -170,17 +200,13 @@ def chunk_by_sentences(text: str, n: int = 1, step: int | None = None) -> list[s
         n: Сколько предложений в одном куске.
         step: На сколько предложений сдвигается окно. По умолчанию равен n,
             то есть куски не перекрываются. При step < n соседние куски перекрываются.
+        detect_sections: Считать ли блоки заглавными буквами заголовками.
 
     Returns:
         Список кусков вида "[РАЗДЕЛ]\\nпредложения через пробел".
     """
-    chunks = []
-    for section, paragraph in split_into_paragraphs(text):
-        sentences = split_into_sentences(paragraph)
-        for i in range(0, len(sentences), step if step is not None else n):
-            group = " ".join(sentences[i:i + n])
-            chunks.append(f"[{section}]\n{group}")
-    return chunks
+    paragraphs = split_into_paragraphs(text, detect_sections=detect_sections)
+    return chunk_paragraphs(paragraphs, n=n, step=step)
 
 
 def chunk_by_sections(text: str) -> list[str]:
@@ -324,26 +350,125 @@ def get_documents_collection() -> "chromadb.Collection":
     )
 
 
+def read_pdf_pages(path: Path) -> list[tuple[int, str]]:
+    """Извлекает текст из PDF постранично.
+
+    Args:
+        path: Путь к PDF-файлу с текстовым слоем.
+
+    Returns:
+        Пары (номер страницы с единицы, текст) для страниц с текстом.
+
+    Raises:
+        ValueError: PDF зашифрован или в нём не найден извлекаемый текст.
+    """
+    reader = PdfReader(path)
+    if reader.is_encrypted:
+        raise ValueError(f"PDF зашифрован: {path.name}")
+
+    pages = []
+    for number, page in enumerate(reader.pages, start=1):
+        text = page.extract_text().strip()
+        if text:
+            pages.append((number, text))
+
+    if not pages:
+        raise ValueError(f"В PDF нет извлекаемого текста: {path.name}")
+    return pages
+
+
+def read_docx_paragraphs(path: Path) -> list[tuple[str, str]]:
+    """Читает абзацы DOCX и сохраняет ближайший заголовок раздела.
+
+    Args:
+        path: Путь к документу DOCX.
+
+    Returns:
+        Пары (название раздела, текст абзаца). Для абзацев перед первым
+        заголовком название раздела — пустая строка.
+
+    Raises:
+        ValueError: В документе нет абзацев основного текста.
+    """
+    document = Document(str(path))
+    paragraphs = []
+    section = ""
+
+    for paragraph in document.paragraphs:
+        text = " ".join(paragraph.text.split())
+        if not text:
+            continue
+        style = paragraph.style
+        style_name = style.name if style is not None else None
+        if style_name and style_name.startswith("Heading "):
+            section = text
+        else:
+            paragraphs.append((section, text))
+
+    if not paragraphs:
+        raise ValueError(f"В DOCX нет абзацев основного текста: {path.name}")
+    return paragraphs
+
+
+def read_document_chunks(path: Path) -> list[tuple[str, int | None]]:
+    """Читает файл и готовит его куски с указанием страниц.
+
+    Args:
+        path: Путь к DOCX, PDF с текстовым слоем или текстовому файлу в UTF-8.
+
+    Returns:
+        Пары (кусок, номер страницы). Для DOCX и TXT номер равен None.
+    """
+    chunks: list[tuple[str, int | None]] = []
+    suffix = path.suffix.lower()
+
+    if suffix == ".pdf":
+        for number, text in read_pdf_pages(path):
+            for chunk in chunk_by_sentences(text, n=2, detect_sections=False):
+                chunks.append((chunk, number))
+    elif suffix == ".docx":
+        paragraphs = read_docx_paragraphs(path)
+        for chunk in chunk_paragraphs(paragraphs, n=2):
+            chunks.append((chunk, None))
+    else:
+        text = path.read_text(encoding="utf-8")
+        for chunk in chunk_by_sentences(text, n=2):
+            chunks.append((chunk, None))
+
+    return chunks
+
+
 def sync_document(path: Path, source: str) -> int:
     """Синхронизирует куски одного документа с базой.
 
     Args:
-        path: Путь к читаемому текстовому файлу.
+        path: Путь к DOCX, PDF с текстовым слоем или текстовому файлу в UTF-8.
         source: Постоянное уникальное имя документа, например handbook.txt.
 
     Returns:
         Число уникальных кусков этого источника после синхронизации.
-        Пустой документ удаляет все записи только своего источника.
+        Пустой текстовый файл удаляет все записи только своего источника.
 
     Raises:
-        ValueError: Имя источника пустое или содержит перевод строки.
+        ValueError: Некорректное имя источника, зашифрованный PDF,
+            PDF без извлекаемого текста или DOCX без абзацев основного текста.
         OSError: Файл не удалось прочитать; записи базы при этом не меняются.
     """
     if not source.strip() or "\n" in source:
         raise ValueError("Нужно непустое имя источника без перевода строки")
-    text = path.read_text(encoding="utf-8")
-    chunks = list(dict.fromkeys(chunk_by_sentences(text, n=2)))
-    ids = [cache_key(f"{source}\n{chunk}") for chunk in chunks]
+    entries = list(dict.fromkeys(read_document_chunks(path)))
+    chunks = []
+    ids = []
+    metadatas: list[Metadata] = []
+    for chunk, page in entries:
+        metadata: Metadata = {"source": source, "section": chunk_section(chunk)}
+        id_text = f"{source}\n{chunk}"
+        if page is not None:
+            metadata["page"] = page
+            id_text = f"{source}\n{page}\n{chunk}"
+        chunks.append(chunk)
+        ids.append(cache_key(id_text))
+        metadatas.append(metadata)
     collection = get_documents_collection()
     old_ids = set(collection.get(where={"source": source}, include=[])["ids"])
     if chunks:
@@ -352,7 +477,7 @@ def sync_document(path: Path, source: str) -> int:
             ids=ids,
             documents=chunks,
             embeddings=vectors.tolist(),
-            metadatas=[{"source": source, "section": chunk_section(chunk)} for chunk in chunks],
+            metadatas=metadatas,
         )
     stale_ids = old_ids - set(ids)
     if stale_ids:
@@ -369,7 +494,8 @@ def search_documents(query: str, k: int = 3, source: str | None = None) -> Found
         source: Точное имя источника; None означает поиск по всем документам.
 
     Returns:
-        Пары (близость, текст с заголовком источника и раздела).
+        Пары (близость, текст фрагмента с заголовком).
+        В заголовке указаны имя источника и раздел для TXT и DOCX или номер страницы для PDF.
         При k <= 0 или отсутствии подходящих записей возвращается пустой список.
     """
     if k <= 0:
@@ -390,7 +516,12 @@ def search_documents(query: str, k: int = 3, source: str | None = None) -> Found
             result["documents"][0], result["distances"][0], result["metadatas"][0]
     ):
         body = chunk.split("\n", 1)[1]
-        label = f"[{metadata['source']} / {metadata['section']}]"
+        page = metadata.get("page")
+        if page is None:
+            location = metadata["section"]
+        else:
+            location = f"стр. {page}"
+        label = f"[{metadata['source']} / {location}]"
         found.append((1 - distance, f"{label}\n{body}"))
     return found
 
@@ -407,7 +538,7 @@ def documents_searcher(query: str, chunks: list[str], chunk_vectors: np.ndarray,
         source: Необязательный фильтр; передаётся только по имени.
 
     Returns:
-        Найденные куски с именами источников и разделов.
+        Найденные куски с именами источников и разделами или номерами страниц.
     """
     return search_documents(query, k, source)
 
