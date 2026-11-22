@@ -14,7 +14,10 @@ from chromadb.api.types import Metadata
 from docx import Document
 from dotenv import load_dotenv
 from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat import (ChatCompletionMessageFunctionToolCall,
+                               ChatCompletionMessageParam,
+                               ChatCompletionFunctionToolParam)
+from pydantic import BaseModel, ConfigDict, Field
 from pypdf import PdfReader
 from sentence_transformers import CrossEncoder
 
@@ -46,6 +49,39 @@ REWRITE_RULE = (
     "Ты переписываешь вопросы для поиска по документу. Перепиши последний вопрос пользователя так, "
     "чтобы он был понятен без истории диалога. Если вопрос и так понятен, верни его без изменений. "
     "Не отвечай на вопрос. Верни только один переписанный вопрос, без пояснений."
+)
+
+
+class StructuredAnswer(BaseModel):
+    """Ответ по найденному контексту с признаком наличия ответа."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    has_answer: bool
+    answer: str
+
+
+class HandbookSearchArgs(BaseModel):
+    """Аргументы поиска по справочнику, которые предлагает модель."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    query: str = Field(min_length=1)
+
+
+HANDBOOK_SEARCH_TOOL: ChatCompletionFunctionToolParam = {
+    "type": "function",
+    "function": {
+        "name": "search_handbook",
+        "description": "Ищет подходящие фрагменты справочника сотрудников по текстовому запросу.",
+        "parameters": HandbookSearchArgs.model_json_schema(),
+    },
+}
+
+HANDBOOK_TOOL_RULE = (
+    "Для каждого вопроса сначала вызови search_handbook ровно один раз. "
+    "Передай в query самостоятельный запрос на русском языке. "
+    "После получения результата ответь только по найденным фрагментам. "
+    "Укажи has_answer=true, если в них есть ответ. "
+    f"Если ответа нет, укажи has_answer=false и запиши в answer «{REFUSAL}»."
 )
 
 
@@ -707,6 +743,126 @@ def build_prompt(question: str, found: Found) -> str:
     rule = f"Ответь на вопрос, используя только информацию из контекста. Если в контексте нет ответа, скажи: «{REFUSAL}»."
     context = "\n\n".join(chunk for score, chunk in found)
     return f"{rule}\n\nКонтекст:\n{context}\n\nВопрос: {question}"
+
+
+def generate_structured_answer(question: str, found: Found) -> StructuredAnswer:
+    """Запрашивает у чат-модели ответ по найденным фрагментам.
+
+    Args:
+        question: Исходный вопрос пользователя.
+        found: Список пар (оценка, текст фрагмента).
+
+    Returns:
+        Объект с признаком наличия ответа и текстом, проверенный по схеме.
+
+    Raises:
+        RuntimeError: API не вернул разобранный структурированный ответ.
+    """
+    instruction = (
+        "Укажи has_answer=true, если в контексте есть ответ на вопрос, иначе has_answer=false. "
+        f"В поле answer запиши ответ. При has_answer=false запиши «{REFUSAL}»."
+    )
+    response = client.chat.completions.parse(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": build_prompt(question, found)},
+        ],
+        response_format=StructuredAnswer,
+        temperature=0,
+    )
+    result = response.choices[0].message.parsed
+    if result is None:
+        raise RuntimeError("Модель не вернула структурированный ответ")
+    return result
+
+
+def request_handbook_search(
+        messages: list[ChatCompletionMessageParam],
+) -> ChatCompletionMessageFunctionToolCall:
+    """Запрашивает у чат-модели вызов инструмента поиска.
+
+    Args:
+        messages: Сообщения с инструкцией и вопросом.
+
+    Returns:
+        Вызов search_handbook с идентификатором и аргументами в JSON.
+
+    Raises:
+        RuntimeError: Модель вернула не один вызов или выбрала другой инструмент.
+    """
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages,
+        tools=[HANDBOOK_SEARCH_TOOL],
+        tool_choice="required",
+        temperature=0,
+    )
+    calls = response.choices[0].message.tool_calls or []
+    if len(calls) != 1:
+        raise RuntimeError("Модель должна запросить ровно один инструмент")
+
+    call = calls[0]
+    if call.type != "function" or call.function.name != "search_handbook":
+        raise RuntimeError("Модель запросила неизвестный инструмент")
+    return call
+
+
+def ask_with_search_tool(
+        question: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3,
+) -> tuple[StructuredAnswer, Found]:
+    """Выполняет поиск по запросу модели и возвращает ответ на вопрос.
+
+    Args:
+        question: Исходный вопрос пользователя.
+        chunks: Фрагменты индексированного справочника.
+        chunk_vectors: Матрица эмбеддингов фрагментов.
+        k: Максимальное число фрагментов для ответа.
+
+    Returns:
+        Структурированный ответ и найденные фрагменты с оценками.
+
+    Raises:
+        RuntimeError: Модель не вернула ожидаемый вызов или разобранный ответ.
+        ValidationError: Аргументы предложенного поиска не прошли проверку.
+    """
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": HANDBOOK_TOOL_RULE},
+        {"role": "user", "content": question},
+    ]
+    call = request_handbook_search(messages)
+    args = HandbookSearchArgs.model_validate_json(call.function.arguments)
+    found = search(args.query, chunks, chunk_vectors, k)
+    context = "\n\n".join(chunk for _, chunk in found) or "Фрагменты не найдены."
+
+    messages.append({
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": call.id,
+            "type": "function",
+            "function": {
+                "name": call.function.name,
+                "arguments": call.function.arguments,
+            },
+        }],
+    })
+    messages.append({
+        "role": "tool",
+        "tool_call_id": call.id,
+        "content": context,
+    })
+
+    response = client.chat.completions.parse(
+        model=CHAT_MODEL,
+        messages=messages,
+        response_format=StructuredAnswer,
+        temperature=0,
+    )
+    result = response.choices[0].message.parsed
+    if result is None:
+        raise RuntimeError("Модель не вернула структурированный ответ")
+    return result, found
 
 
 def chunk_section(chunk: str) -> str:

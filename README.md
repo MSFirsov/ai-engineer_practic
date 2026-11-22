@@ -318,6 +318,31 @@ uv run evaluate.py --rerank
 
 В этом запуске реранкинг добавил 2,86 с на 34 вопроса без учёта загрузки модели. В чат реранкер можно подключить из Python через `ask(..., searcher=reranked_search)`. Обычный запуск чата использует поиск по эмбеддингам.
 
+## Структурированный ответ и вызов поиска
+
+Pydantic входит в зависимости проекта и устанавливается через `uv sync --locked`. Для примера ниже запусти embedding-модель и чат-модель в LM Studio.
+
+- `generate_structured_answer(question, found)` принимает вопрос и уже найденные фрагменты. Чат-модель возвращает ответ по JSON Schema, а Python получает объект `StructuredAnswer` с полями `has_answer` и `answer`.
+- `ask_with_search_tool(question, chunks, vectors)` сначала передаёт модели описание инструмента `search_handbook`. Python проверяет полученный аргумент `query`, выполняет `search()` и отправляет найденные фрагменты модели с ID вызова. Второй запрос возвращает `StructuredAnswer`. Функция также возвращает найденные фрагменты.
+
+```bash
+uv run --env-file .env.example python - <<'PY'
+from rag import ask_with_search_tool, build_index, generate_structured_answer, search
+
+question = "Сколько дней отпуска в году?"
+chunks, vectors = build_index()
+found = search(question, chunks, vectors, k=3)
+print(generate_structured_answer(question, found).model_dump_json())
+
+answer, _ = ask_with_search_tool(question, chunks, vectors)
+print(answer.model_dump_json())
+PY
+```
+
+Оба вызова выводят JSON с `"has_answer": true` и текстом про 28 дней отпуска. Формулировка ответа может отличаться. На вопрос без ответа в контексте в проверке получен `"has_answer": false` и текст «В документе этого нет». Схема проверяет поля и типы данных. Соответствие ответа документу проверяется по фрагментам.
+
+Обе функции доступны из Python. Команда `uv run rag.py` запускает обычный чат.
+
 ## Настройки
 
 Задаются в `.env`:
