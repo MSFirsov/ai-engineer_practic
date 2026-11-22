@@ -7,4 +7,5 @@ dependencies = [
     "numpy>=2.5.3",
     "openai>=3.29.0",
     "python-dotenv>=1.2.4",
+    "sentence-transformers>=6.3.0",
 ]

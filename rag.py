@@ -10,6 +10,7 @@ from pathlib import Path
 
 import chromadb
 import numpy as np
+from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
@@ -30,6 +31,7 @@ Searcher = Callable[[str, list[str], np.ndarray, int], Found]
 
 MAX_HISTORY = 3
 POOL = 10
+RERANK_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 RRF_K = 60
 STOP_WORDS = set(
     "а в во и или ли не на с со к ко по о об от до за из у что кто как когда где куда сколько "
@@ -495,6 +497,69 @@ def hybrid_search(query: str, chunks: list[str], chunk_vectors: np.ndarray, k: i
             scores[chunk] = scores.get(chunk, 0.0) + 1 / (RRF_K + rank)
     ranked = sorted(((score, chunk) for chunk, score in scores.items()), reverse=True)
     return ranked[:k]
+
+
+@lru_cache(maxsize=1)
+def get_reranker() -> "CrossEncoder":
+    """Загружает CrossEncoder один раз на процесс.
+
+    Returns:
+        Локальная модель оценки пары «запрос — фрагмент» на CPU.
+    """
+    return CrossEncoder(
+        RERANK_MODEL,
+        device="cpu",
+        max_length=512,
+        cache_folder=str(Path(__file__).resolve().parent / ".cache" / "reranker"),
+    )
+
+
+def rerank(query: str, candidates: Found, k: int = 3) -> Found:
+    """Переоценивает найденные фрагменты по отношению к запросу.
+
+    Args:
+        query: Текст поискового запроса.
+        candidates: Кандидаты первого поиска; исходные оценки не используются.
+        k: Максимальное число результатов.
+
+    Returns:
+        Пары (оценка CrossEncoder, исходный текст) по убыванию оценки.
+        При пустом списке или k <= 0 возвращается пустой список.
+    """
+    if not candidates or k <= 0:
+        return []
+    texts = [text for _, text in candidates]
+    pairs = [(query, text) for text in texts]
+    scores = get_reranker().predict(pairs, batch_size=16, show_progress_bar=False)
+    ranked = sorted(zip(scores, texts), key=lambda item: item[0], reverse=True)
+    return [(float(score), text) for score, text in ranked[:k]]
+
+
+def reranked_search(query: str, chunks: list[str], chunk_vectors: np.ndarray,
+                    k: int = 3, *, base_searcher: Searcher = search,
+                    pool_size: int = 20) -> Found:
+    """Отбирает кандидатов обычным поиском и переоценивает CrossEncoder.
+
+    Args:
+        query: Поисковый запрос.
+        chunks: Куски для исходного поиска; для Chroma могут быть пустыми.
+        chunk_vectors: Векторы для исходного поиска.
+        k: Сколько результатов вернуть после реранкинга.
+        base_searcher: Поиск первого этапа, по умолчанию NumPy.
+        pool_size: Сколько кандидатов запросить на первом этапе.
+
+    Returns:
+        Найденные фрагменты с оценками CrossEncoder; при k <= 0 — пустой список.
+
+    Raises:
+        ValueError: Число кандидатов меньше запрошенного k.
+    """
+    if k <= 0:
+        return []
+    if pool_size < k:
+        raise ValueError("pool_size должен быть не менее k")
+    candidates = base_searcher(query, chunks, chunk_vectors, pool_size)
+    return rerank(query, candidates, k)
 
 
 def build_prompt(question: str, found: Found) -> str:

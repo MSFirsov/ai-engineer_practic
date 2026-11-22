@@ -20,6 +20,8 @@ from rag import (
     rewrite_query,
     search,
     split_into_chunks,
+    rerank,
+    get_reranker,
 )
 
 EVAL_SET = [
@@ -302,7 +304,65 @@ def compare_chroma() -> None:
     )
 
 
+def compare_reranking(eval_set: list[dict[str, str]], chunks: list[str],
+                      chunk_vectors: np.ndarray, pool_size: int = 20) -> None:
+    """Сравнивает исходную выдачу и реранкинг одних и тех же кандидатов.
+
+    Args:
+        eval_set: Непустой набор вопросов и ожидаемых подстрок.
+        chunks: Куски справочника.
+        chunk_vectors: Их векторы для поиска NumPy.
+        pool_size: Число кандидатов первого этапа, не меньше трёх.
+
+    Raises:
+        ValueError: Набор пуст или число кандидатов меньше трёх.
+    """
+    if not eval_set or pool_size < 3:
+        raise ValueError("Нужны вопросы и pool_size >= 3")
+    totals = {"до": [0, 0, 0.0], "после": [0, 0, 0.0]}
+    pool_hits = 0
+    search_time = 0.0
+    rerank_time = 0.0
+    for item in eval_set:
+        query, expected = item["question"], item["expected"]
+        start = time.perf_counter()
+        candidates = search(query, chunks, chunk_vectors, pool_size)
+        search_time += time.perf_counter() - start
+        if find_rank(candidates, expected) is not None:
+            pool_hits += 1
+        before = candidates[:3]
+        start = time.perf_counter()
+        after = rerank(query, candidates, k=3)
+        rerank_time += time.perf_counter() - start
+        for name, found in (("до", before), ("после", after)):
+            rank = find_rank(found, expected)
+            if rank is not None:
+                totals[name][0] += int(rank == 1)
+                totals[name][1] += 1
+                totals[name][2] += 1 / rank
+        before_rank = find_rank(before, expected)
+        after_rank = find_rank(after, expected)
+        if before_rank != after_rank:
+            print(f"  {query}: {before_rank} -> {after_rank}")
+    count = len(eval_set)
+    print(f"Кандидаты: hit@{pool_size} = {pool_hits / count:.2f}")
+    for name, (hit1, hit3, rr) in totals.items():
+        print(f"{name}: hit@1 = {hit1 / count:.2f}  hit@3 = {hit3 / count:.2f}  MRR = {rr / count:.2f}")
+    print(f"Поиск: {search_time:.2f} с; реранкинг: {rerank_time:.2f} с; вопросов: {count}")
+
+
 if __name__ == "__main__":
+    if "--rerank" in sys.argv:
+        if "--fast" in sys.argv or "--chroma" in sys.argv:
+            raise SystemExit("Запускай --rerank отдельно от --fast и --chroma")
+        start = time.perf_counter()
+        get_reranker()
+        print(f"Загрузка реранкера: {time.perf_counter() - start:.2f} с")
+        chunks, chunk_vectors = build_index()
+        for name, dataset in (("обычные", EVAL_SET), ("точные", EXACT_SET)):
+            print(name)
+            compare_reranking(dataset, chunks, chunk_vectors)
+        raise SystemExit(0)
     if "--chroma" in sys.argv:
         compare_chroma()
         raise SystemExit(0)
