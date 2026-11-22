@@ -8,10 +8,11 @@ from collections.abc import Callable
 from functools import partial, lru_cache
 from pathlib import Path
 
+import chromadb
+import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
-import numpy as np
 
 load_dotenv()
 
@@ -20,6 +21,7 @@ CHAT_MODEL = os.environ["CHAT_MODEL"]
 EMBED_MODEL = os.environ["EMBED_MODEL"]
 HANDBOOK = Path(__file__).resolve().parent / "handbook.txt"
 CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "embeddings"
+CHROMA_DIR = Path(__file__).resolve().parent / ".cache" / "chroma"
 
 Chunker = Callable[[str], list[str]]
 Found = list[tuple[float, str]]
@@ -68,6 +70,7 @@ def cache_key(text: str) -> str:
     """
     data = f"{EMBED_MODEL}\n{text}"
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
 
 def embed_cached(texts: list[str]) -> np.ndarray:
     """Возвращает эмбеддинги текстов, считая только те, которых нет в кэше.
@@ -198,7 +201,8 @@ def chunk_by_sections(text: str) -> list[str]:
     return chunks
 
 
-def build_index(path: Path = HANDBOOK, chunker: Chunker = partial(chunk_by_sentences, n=2)) -> tuple[list[str], np.ndarray]:
+def build_index(path: Path = HANDBOOK, chunker: Chunker = partial(chunk_by_sentences, n=2)) -> tuple[
+    list[str], np.ndarray]:
     """Читает документ, режет его на куски и считает их эмбеддинги.
 
     Args:
@@ -245,6 +249,165 @@ def search(query: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3)
     scores = [cosine(query_vec, v) for v in chunk_vectors]
     ranked = sorted(zip(scores, chunks), reverse=True)
     return ranked[:k]
+
+
+def get_collection() -> "chromadb.Collection":
+    """Открывает локальную коллекцию Chroma для текущей модели эмбеддингов.
+
+    Returns:
+        Коллекция с косинусным расстоянием и готовыми внешними эмбеддингами.
+    """
+    db = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    return db.get_or_create_collection(
+        name=f"handbook-{cache_key('')[:12]}",
+        configuration={"hnsw": {"space": "cosine"}},
+        embedding_function=None,
+    )
+
+
+def save_to_chroma(chunks: list[str], chunk_vectors: np.ndarray) -> int:
+    """Сохраняет куски и их векторы в Chroma по стабильным идентификаторам.
+
+    Args:
+        chunks: Непустой список уникальных кусков текущего справочника.
+        chunk_vectors: Матрица эмбеддингов в том же порядке, что и chunks.
+
+    Returns:
+        Общее число записей в коллекции после сохранения.
+    """
+    collection = get_collection()
+    collection.upsert(
+        ids=[cache_key(chunk) for chunk in chunks],
+        documents=chunks,
+        embeddings=chunk_vectors.tolist(),
+    )
+    return collection.count()
+
+
+def search_chroma(query: str, k: int = 3) -> Found:
+    """Ищет куски в сохранённой базе без повторного чтения справочника.
+
+    Args:
+        query: Текст поискового запроса.
+        k: Максимальное число результатов.
+
+    Returns:
+        Пары (косинусная близость, кусок) от лучшего к худшему.
+        Для пустой коллекции или k <= 0 возвращается пустой список.
+    """
+    collection = get_collection()
+    if collection.count() == 0 or k <= 0:
+        return []
+    result = collection.query(
+        query_embeddings=[embed_query(query).tolist()],
+        n_results=min(k, collection.count()),
+        include=["documents", "distances"],
+    )
+    documents = result["documents"][0]
+    distances = result["distances"][0]
+    return [(1 - distance, chunk) for distance, chunk in zip(distances, documents)]
+
+
+def get_documents_collection() -> "chromadb.Collection":
+    """Открывает отдельную коллекцию документов с метаданными.
+
+    Returns:
+        Коллекция для текущей embedding-модели с косинусным расстоянием.
+    """
+    db = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    return db.get_or_create_collection(
+        name=f"documents-{cache_key('')[:12]}",
+        configuration={"hnsw": {"space": "cosine"}},
+        embedding_function=None,
+    )
+
+
+def sync_document(path: Path, source: str) -> int:
+    """Синхронизирует куски одного документа с базой.
+
+    Args:
+        path: Путь к читаемому текстовому файлу.
+        source: Постоянное уникальное имя документа, например handbook.txt.
+
+    Returns:
+        Число уникальных кусков этого источника после синхронизации.
+        Пустой документ удаляет все записи только своего источника.
+
+    Raises:
+        ValueError: Имя источника пустое или содержит перевод строки.
+        OSError: Файл не удалось прочитать; записи базы при этом не меняются.
+    """
+    if not source.strip() or "\n" in source:
+        raise ValueError("Нужно непустое имя источника без перевода строки")
+    text = path.read_text(encoding="utf-8")
+    chunks = list(dict.fromkeys(chunk_by_sentences(text, n=2)))
+    ids = [cache_key(f"{source}\n{chunk}") for chunk in chunks]
+    collection = get_documents_collection()
+    old_ids = set(collection.get(where={"source": source}, include=[])["ids"])
+    if chunks:
+        vectors = embed_cached(chunks)
+        collection.upsert(
+            ids=ids,
+            documents=chunks,
+            embeddings=vectors.tolist(),
+            metadatas=[{"source": source, "section": chunk_section(chunk)} for chunk in chunks],
+        )
+    stale_ids = old_ids - set(ids)
+    if stale_ids:
+        collection.delete(ids=sorted(stale_ids))
+    return len(chunks)
+
+
+def search_documents(query: str, k: int = 3, source: str | None = None) -> Found:
+    """Ищет по всем документам или одному источнику.
+
+    Args:
+        query: Поисковый запрос.
+        k: Максимальное число результатов.
+        source: Точное имя источника; None означает поиск по всем документам.
+
+    Returns:
+        Пары (близость, текст с заголовком источника и раздела).
+        При k <= 0 или отсутствии подходящих записей возвращается пустой список.
+    """
+    if k <= 0:
+        return []
+    collection = get_documents_collection()
+    where = {"source": source} if source is not None else None
+    count = len(collection.get(where=where, include=[])["ids"])
+    if count == 0:
+        return []
+    result = collection.query(
+        query_embeddings=[embed_query(query).tolist()],
+        n_results=min(k, count),
+        where=where,
+        include=["documents", "distances", "metadatas"],
+    )
+    found = []
+    for chunk, distance, metadata in zip(
+            result["documents"][0], result["distances"][0], result["metadatas"][0]
+    ):
+        body = chunk.split("\n", 1)[1]
+        label = f"[{metadata['source']} / {metadata['section']}]"
+        found.append((1 - distance, f"{label}\n{body}"))
+    return found
+
+
+def documents_searcher(query: str, chunks: list[str], chunk_vectors: np.ndarray,
+                       k: int = 3, *, source: str | None = None) -> Found:
+    """Подключает поиск документов к ask и evaluate.
+
+    Args:
+        query: Поисковый запрос.
+        chunks: Не используется; тексты находятся в базе.
+        chunk_vectors: Не используется; векторы находятся в базе.
+        k: Максимальное число результатов.
+        source: Необязательный фильтр; передаётся только по имени.
+
+    Returns:
+        Найденные куски с именами источников и разделов.
+    """
+    return search_documents(query, k, source)
 
 
 def tokenize(text: str) -> list[str]:
@@ -444,26 +607,83 @@ def ask(question: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3,
     return response.choices[0].message.content or "", found
 
 
-if __name__ == "__main__":
+def chroma_searcher(query: str, chunks: list[str], chunk_vectors: np.ndarray, k: int = 3) -> Found:
+    """Подключает поиск Chroma к общему интерфейсу Searcher.
+
+    Args:
+        query: Поисковый запрос.
+        chunks: Не используется; тексты уже находятся в Chroma.
+        chunk_vectors: Не используется; векторы уже находятся в Chroma.
+        k: Максимальное число результатов.
+
+    Returns:
+        Найденные пары (близость, текст).
+    """
+    return search_chroma(query, k)
+
+
+def prepare_search(use_chroma: bool = False, use_hybrid: bool = False) -> tuple[list[str], np.ndarray, Searcher]:
+    """Готовит данные и функцию для выбранного способа поиска.
+
+    Args:
+        use_chroma: Использовать сохранённую базу без build_index.
+        use_hybrid: Использовать гибридный поиск по индексу в памяти.
+
+    Returns:
+        Куски, векторы и функция поиска. Для Chroma данные пустые.
+
+    Raises:
+        ValueError: Выбраны несовместимые режимы или база пуста.
+    """
+    if use_chroma and use_hybrid:
+        raise ValueError("Выбери один режим: --chroma или --hybrid")
+    if use_chroma:
+        if get_collection().count() == 0:
+            raise ValueError("База пуста. Сначала выполни: uv run rag.py --index")
+        return [], np.empty((0, 0)), chroma_searcher
     chunks, chunk_vectors = build_index()
-    print(f"Кусков: {len(chunks)}, векторы: {chunk_vectors.shape}")
+    return chunks, chunk_vectors, hybrid_search if use_hybrid else search
 
-    searcher: Searcher = search
-    if "--hybrid" in sys.argv:
-        searcher = hybrid_search
+
+def main() -> None:
+    """Запускает загрузку базы, поиск без генерации или диалог по справочнику."""
+    use_chroma = "--chroma" in sys.argv
+    use_hybrid = "--hybrid" in sys.argv
+    search_only = "--search-only" in sys.argv
+    if "--index" in sys.argv:
+        if use_chroma or use_hybrid or search_only:
+            raise SystemExit("Запускай --index отдельно от режимов поиска")
+        chunks, chunk_vectors = build_index()
+        print(f"Записей в Chroma: {save_to_chroma(chunks, chunk_vectors)}")
+        return
+    try:
+        chunks, chunk_vectors, searcher = prepare_search(use_chroma, use_hybrid)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     print(f"Поиск: {searcher.__name__}")
-
+    if search_only:
+        print("Режим поиска: без ответа модели и без истории диалога")
     history: History = []
     while True:
         question = input("\nВопрос: ")
         if question.lower() in ("выход", "exit"):
             break
+        if search_only:
+            found = searcher(question, chunks, chunk_vectors, 3)
+            print("\n--- Найденные куски ---")
+            for score, chunk in found:
+                print(f"{score:.3f} {chunk}")
+            continue
         answer, found = ask(question, chunks, chunk_vectors, history=history[-MAX_HISTORY:], searcher=searcher)
         history.append((question, answer))
         print("\n--- Найденные куски ---")
         for score, chunk in found:
-            print(f"{score:.3f}  {chunk[:80]!r}")
+            print(f"{score:.3f} {chunk[:80]!r}")
         print("\n--- Ответ ---")
         print(answer)
         if REFUSAL not in answer:
             print("Источник: ", "; ".join(list_sources(found)))
+
+
+if __name__ == "__main__":
+    main()

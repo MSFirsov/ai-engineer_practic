@@ -3,8 +3,24 @@ import time
 
 import numpy as np
 
-from rag import (REFUSAL, Chunker, Found, Searcher, build_index, search, keyword_search, hybrid_search, ask,
-                 rewrite_query, split_into_chunks, chunk_by_sentences, chunk_by_sections)
+from rag import (
+    REFUSAL,
+    Chunker,
+    Found,
+    Searcher,
+    ask,
+    build_index,
+    cache_key,
+    chroma_searcher,
+    chunk_by_sections,
+    chunk_by_sentences,
+    get_collection,
+    hybrid_search,
+    keyword_search,
+    rewrite_query,
+    search,
+    split_into_chunks,
+)
 
 EVAL_SET = [
     {"question": "Сколько дней отпуска в году?", "expected": "28 календарных"},
@@ -82,7 +98,8 @@ FOLLOWUP_SET = [
     {"history": [("Куда писать, если сломался ноутбук?", "В канал #it-help.")],
      "question": "А что с ним делать при увольнении?", "expected": "вернуть в течение 5"},
     {"history": [("Сколько дней здоровья в году?", "5 дней."),
-                 ("А если болезнь длится дольше?", "Нужно оформить больничный лист и отправить его номер Дарье Лосевой.")],
+                 ("А если болезнь длится дольше?",
+                  "Нужно оформить больничный лист и отправить его номер Дарье Лосевой.")],
      "question": "А их можно перенести на следующий год?", "expected": "Дни здоровья не переносятся"},
     {"history": [("Сколько компания компенсирует на обучение?", "До 60 000 рублей в год.")],
      "question": "Во сколько стендап?", "expected": "11:15"},
@@ -263,7 +280,32 @@ def compare_followups(followup_set: list[dict], chunks: list[str], chunk_vectors
         print(f"{mode:<15} hit@1 = {hit1:.2f}   hit@3 = {hit3:.2f}   MRR = {mrr:.2f}   запросы: {query_time:.1f} с")
 
 
+def compare_chroma() -> None:
+    """Сравнивает NumPy и сохранённую Chroma на одинаковых кусках.
+
+    Читает справочник для базы сравнения NumPy, но не изменяет Chroma.
+    Проверяет совпадение идентификаторов до вычисления метрик.
+
+    Raises:
+        ValueError: В базе другой набор кусков или база пуста.
+    """
+    chunks, chunk_vectors = build_index()
+    expected_ids = {cache_key(chunk) for chunk in chunks}
+    actual_ids = set(get_collection().get(include=[])["ids"])
+    if actual_ids != expected_ids:
+        raise ValueError("Набор кусков в Chroma отличается от справочника. Проверь индексацию.")
+    compare_searchers(
+        {"NumPy": search, "Chroma": chroma_searcher},
+        {"обычные вопросы": EVAL_SET, "точные вопросы": EXACT_SET},
+        chunks,
+        chunk_vectors,
+    )
+
+
 if __name__ == "__main__":
+    if "--chroma" in sys.argv:
+        compare_chroma()
+        raise SystemExit(0)
     fast = "--fast" in sys.argv
     total_start = time.perf_counter()
     chunks, chunk_vectors = build_index()
