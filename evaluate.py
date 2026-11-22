@@ -351,7 +351,62 @@ def compare_reranking(eval_set: list[dict[str, str]], chunks: list[str],
     print(f"Поиск: {search_time:.2f} с; реранкинг: {rerank_time:.2f} с; вопросов: {count}")
 
 
+def compare_langchain(include_answers: bool = True) -> None:
+    """Сравнивает поиск NumPy и LangChain, а затем примеры ответов.
+
+    Args:
+        include_answers: Запускать ли примеры с чат-моделью.
+    """
+    from rag_langchain import (
+        ask_langchain,
+        build_langchain_answer_chain,
+        build_langchain_store,
+        search_langchain,
+    )
+
+    chunks, vectors = build_index()
+    store = build_langchain_store(chunks)
+
+    def langchain_searcher(
+            query: str, _chunks: list[str], _vectors: np.ndarray, k: int,
+    ) -> Found:
+        return search_langchain(query, store, k=k)
+
+    print("=== Сравнение поиска ===")
+    compare_searchers(
+        {"NumPy": search, "LangChain": langchain_searcher},
+        {"обычные вопросы": EVAL_SET, "точные запросы": EXACT_SET},
+        chunks,
+        vectors,
+    )
+
+    if not include_answers:
+        return
+
+    chain = build_langchain_answer_chain()
+    cases = [
+        ("Сколько дней отпуска в году?", "28"),
+        ("Куда писать, если сломался ноутбук?", "#it-help"),
+        (NO_ANSWER[0], REFUSAL),
+    ]
+    print("\n=== Примеры ответов ===")
+    for question, expected in cases:
+        baseline_answer, _ = ask(question, chunks, vectors)
+        langchain_answer, _ = ask_langchain(question, store, chain)
+        print(f"Вопрос: {question}")
+        print(f"Ищем в ответах: {expected!r}")
+        for name, answer in (("NumPy + SDK", baseline_answer), ("LangChain", langchain_answer)):
+            has_expected = expected.casefold() in answer.casefold()
+            print(f"  {name}: {answer}")
+            print(f"  Ожидаемая подстрока найдена: {has_expected}")
+
+
 if __name__ == "__main__":
+    if "--langchain" in sys.argv:
+        if "--rerank" in sys.argv or "--chroma" in sys.argv:
+            raise SystemExit("Запускай --langchain отдельно от --rerank и --chroma")
+        compare_langchain(include_answers="--fast" not in sys.argv)
+        raise SystemExit(0)
     if "--rerank" in sys.argv:
         if "--fast" in sys.argv or "--chroma" in sys.argv:
             raise SystemExit("Запускай --rerank отдельно от --fast и --chroma")
