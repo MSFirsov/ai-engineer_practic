@@ -1,4 +1,5 @@
 import os
+import readline
 
 from langchain_core.documents import Document
 from langchain_core.runnables import Runnable
@@ -7,13 +8,23 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-import rag
+from rag_common import (
+    HANDBOOK,
+    REFUSAL,
+    Found,
+    build_prompt,
+    chunk_by_sentences,
+    list_sources,
+    load_model_names,
+)
+
+CHAT_MODEL, EMBED_MODEL = load_model_names()
 
 
 def create_langchain_embeddings() -> OpenAIEmbeddings:
     """Настраивает получение эмбеддингов через локальную LM Studio."""
     return OpenAIEmbeddings(
-        model=rag.EMBED_MODEL,
+        model=EMBED_MODEL,
         base_url=os.environ["OPENAI_BASE_URL"],
         check_embedding_ctx_length=False,
     )
@@ -34,7 +45,7 @@ def build_langchain_store(chunks: list[str]) -> InMemoryVectorStore:
     return store
 
 
-def search_langchain(query: str, store: InMemoryVectorStore, k: int = 3) -> rag.Found:
+def search_langchain(query: str, store: InMemoryVectorStore, k: int = 3) -> Found:
     """Ищет в LangChain и приводит результат к формату проекта.
 
     Args:
@@ -59,7 +70,7 @@ def build_langchain_answer_chain() -> Runnable[dict[str, str], str]:
     """
     prompt_template = ChatPromptTemplate.from_messages([("human", "{prompt}")])
     chat = ChatOpenAI(
-        model=rag.CHAT_MODEL,
+        model=CHAT_MODEL,
         base_url=os.environ["OPENAI_BASE_URL"],
         temperature=0.2,
         use_responses_api=False,
@@ -72,7 +83,7 @@ def ask_langchain(
     store: InMemoryVectorStore,
     answer_chain: Runnable[dict[str, str], str],
     k: int = 3,
-) -> tuple[str, rag.Found]:
+) -> tuple[str, Found]:
     """Ищет фрагменты и отвечает через цепочку LangChain.
 
     Args:
@@ -85,6 +96,39 @@ def ask_langchain(
         Пара (ответ модели, найденные фрагменты с оценками).
     """
     found = search_langchain(question, store, k=k)
-    prompt = rag.build_prompt(question, found)
+    prompt = build_prompt(question, found)
     answer = answer_chain.invoke({"prompt": prompt})
     return answer, found
+
+
+def main() -> None:
+    """Запускает интерактивный чат по справочнику через LangChain."""
+    print("Готовлю индекс справочника LangChain…")
+    text = HANDBOOK.read_text(encoding="utf-8")
+    chunks = chunk_by_sentences(text, n=2)
+    store = build_langchain_store(chunks)
+    answer_chain = build_langchain_answer_chain()
+    print("Поиск: LangChain. Для завершения введите «выход» или exit.")
+
+    try:
+        while True:
+            question = input("\nВопрос: ").strip()
+            if question.casefold() in ("выход", "exit"):
+                break
+            if not question:
+                continue
+
+            answer, found = ask_langchain(question, store, answer_chain)
+            print("\n--- Найденные куски ---")
+            for score, chunk in found:
+                print(f"{score:.3f} {chunk[:80]!r}")
+            print("\n--- Ответ ---")
+            print(answer)
+            if found and REFUSAL not in answer:
+                print(f"Источник: {'; '.join(list_sources(found))}")
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+
+if __name__ == "__main__":
+    main()
