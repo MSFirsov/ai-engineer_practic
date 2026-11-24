@@ -373,6 +373,68 @@ uv run --env-file .env.example evaluate.py --langchain
 
 В полном прогоне обе версии также прошли три проверки ответов по ожидаемым подстрокам: 28 дней отпуска, канал `#it-help` и отказ на вопрос о зарплате.
 
+## Поиск и загрузка документов через LlamaIndex
+
+Для этого режима в LM Studio достаточно embedding-модели. Сравнение использует одну нарезку справочника и одни и те же вопросы для NumPy, LangChain и LlamaIndex. Каждый вариант строит свой индекс. `rag_llamaindex.py` создаёт индекс LlamaIndex в памяти из готовых фрагментов.
+
+```bash
+uv sync --locked
+uv run --env-file .env.example evaluate.py --llamaindex
+```
+
+При проверке метрики трёх способов совпали.
+
+| Набор | hit@1 | hit@3 | MRR |
+|---|---:|---:|---:|
+| Обычные вопросы (20) | 0.85 | 0.95 | 0.89 |
+| Точные запросы (14) | 0.71 | 1.00 | 0.85 |
+
+### Постоянный индекс для TXT
+
+В `rag_llamaindex_ingestion.py` на вход поступает целый TXT-файл. `SentenceSplitter` делает фрагменты, а `IngestionPipeline` получает для них эмбеддинги и сохраняет их в Chroma. При повторной загрузке тот же `source` позволяет найти предыдущую версию документа. Неизменившийся файл пропускается.
+
+- `chroma/` хранит тексты и векторы. Для поиска достаточно открыть эту коллекцию.
+- `pipeline/` хранит хеши документов и кэш операций. После успешной загрузки сохраняем эту папку через `pipeline.persist()`, чтобы при следующем запуске можно было продолжить обновление.
+
+Создай временную папку с примером:
+
+```bash
+export LLAMAINDEX_DEMO_DIR="$(mktemp -d)"
+printf '%s\n' 'Бронь длится 90 минут.' > "$LLAMAINDEX_DEMO_DIR/rules.txt"
+```
+
+В том же терминале проиндексируй файл и проверь поиск:
+
+```bash
+uv run --env-file .env.example python - <<'PY'
+import os
+from pathlib import Path
+
+from llama_index.core import VectorStoreIndex
+
+from rag_llamaindex import create_llamaindex_embeddings, search_llamaindex
+from rag_llamaindex_ingestion import (
+    open_llamaindex_store,
+    restore_llamaindex_pipeline,
+    sync_llamaindex_document,
+)
+
+root = Path(os.environ["LLAMAINDEX_DEMO_DIR"])
+state_dir = root / "pipeline"
+store = open_llamaindex_store(root / "chroma")
+pipeline = restore_llamaindex_pipeline(store, state_dir)
+processed = sync_llamaindex_document(root / "rules.txt", "rules.txt", pipeline)
+pipeline.persist(persist_dir=str(state_dir))
+
+index = VectorStoreIndex.from_vector_store(store, embed_model=create_llamaindex_embeddings())
+found = search_llamaindex("Сколько длится бронь?", index, k=1)
+print("Обработано фрагментов:", processed)
+print(found[0][1])
+PY
+```
+
+Первый запуск обработает один фрагмент. Если повторить только второй блок, он покажет `0` обработанных фрагментов, и правило по-прежнему найдётся. Замени в `rules.txt` 90 на 60 и запусти второй блок снова. Выдача покажет новую версию.
+
 ## Настройки
 
 Задаются в `.env`:

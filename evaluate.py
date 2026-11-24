@@ -401,7 +401,40 @@ def compare_langchain(include_answers: bool = True) -> None:
             print(f"  Ожидаемая подстрока найдена: {has_expected}")
 
 
+def compare_llamaindex() -> None:
+    """Сравнивает поиск NumPy, LangChain и LlamaIndex на тех же вопросах."""
+    from rag_langchain import build_langchain_store, search_langchain
+    from rag_llamaindex import build_llamaindex_index, search_llamaindex
+
+    chunks, vectors = build_index()
+    langchain_store = build_langchain_store(chunks)
+    llamaindex_index = build_llamaindex_index(chunks)
+
+    def langchain_searcher(
+            query: str, _chunks: list[str], _vectors: np.ndarray, k: int,
+    ) -> Found:
+        return search_langchain(query, langchain_store, k=k)
+
+    def llamaindex_searcher(
+            query: str, _chunks: list[str], _vectors: np.ndarray, k: int,
+    ) -> Found:
+        return search_llamaindex(query, llamaindex_index, k=k)
+
+    print("=== Сравнение поиска ===")
+    compare_searchers(
+        {"NumPy": search, "LangChain": langchain_searcher, "LlamaIndex": llamaindex_searcher},
+        {"обычные вопросы": EVAL_SET, "точные запросы": EXACT_SET},
+        chunks,
+        vectors,
+    )
+
+
 if __name__ == "__main__":
+    if "--llamaindex" in sys.argv:
+        if any(flag in sys.argv for flag in ("--langchain", "--rerank", "--chroma")):
+            raise SystemExit("Запускай --llamaindex отдельно от --langchain, --rerank и --chroma")
+        compare_llamaindex()
+        raise SystemExit(0)
     if "--langchain" in sys.argv:
         if "--rerank" in sys.argv or "--chroma" in sys.argv:
             raise SystemExit("Запускай --langchain отдельно от --rerank и --chroma")
